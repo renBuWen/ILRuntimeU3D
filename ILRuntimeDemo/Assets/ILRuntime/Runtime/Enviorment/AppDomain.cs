@@ -18,6 +18,7 @@ namespace ILRuntime.Runtime.Enviorment
 {
     public unsafe delegate StackObject* CLRRedirectionDelegate(ILIntepreter intp, StackObject* esp, IList<object> mStack, CLRMethod method, bool isNewObj);
     public delegate object CLRFieldGetterDelegate(ref object target);
+    public unsafe delegate StackObject* CLRFieldBindingDelegate(ref object target, ILIntepreter __intp, StackObject* __esp, IList<object> __mStack);
     public delegate void CLRFieldSetterDelegate(ref object target, object value);
     public delegate object CLRMemberwiseCloneDelegate(ref object target);
     public delegate object CLRCreateDefaultInstanceDelegate();
@@ -44,6 +45,7 @@ namespace ILRuntime.Runtime.Enviorment
         Dictionary<System.Reflection.MethodBase, CLRRedirectionDelegate> redirectMap = new Dictionary<System.Reflection.MethodBase, CLRRedirectionDelegate>();
         Dictionary<System.Reflection.FieldInfo, CLRFieldGetterDelegate> fieldGetterMap = new Dictionary<System.Reflection.FieldInfo, CLRFieldGetterDelegate>();
         Dictionary<System.Reflection.FieldInfo, CLRFieldSetterDelegate> fieldSetterMap = new Dictionary<System.Reflection.FieldInfo, CLRFieldSetterDelegate>();
+        Dictionary<System.Reflection.FieldInfo, KeyValuePair<CLRFieldBindingDelegate, CLRFieldBindingDelegate>> fieldBindingMap = new Dictionary<FieldInfo, KeyValuePair<CLRFieldBindingDelegate, CLRFieldBindingDelegate>>();
         Dictionary<Type, CLRMemberwiseCloneDelegate> memberwiseCloneMap = new Dictionary<Type, CLRMemberwiseCloneDelegate>(new ByReferenceKeyComparer<Type>());
         Dictionary<Type, CLRCreateDefaultInstanceDelegate> createDefaultInstanceMap = new Dictionary<Type, CLRCreateDefaultInstanceDelegate>(new ByReferenceKeyComparer<Type>());
         Dictionary<Type, CLRCreateArrayInstanceDelegate> createArrayInstanceMap = new Dictionary<Type, CLRCreateArrayInstanceDelegate>(new ByReferenceKeyComparer<Type>());
@@ -65,6 +67,8 @@ namespace ILRuntime.Runtime.Enviorment
             return UnityMainThreadID != 0 && (UnityMainThreadID != System.Threading.Thread.CurrentThread.ManagedThreadId);
         }
 #endif
+        internal bool SuppressStaticConstructor { get; set; }
+
         public unsafe AppDomain()
         {
             AllowUnboundCLRMethod = true;
@@ -142,6 +146,12 @@ namespace ILRuntime.Runtime.Enviorment
                 {
                     RegisterCLRMethodRedirection(i, CLRRedirections.EnumGetName);
                 }
+#if NET_4_6 || NET_STANDARD_2_0
+                if(i.Name == "HasFlag")
+                {
+                    RegisterCLRMethodRedirection(i, CLRRedirections.EnumHasFlag);
+                }
+#endif
                 if (i.Name == "ToObject" && i.GetParameters()[1].ParameterType == typeof(int))
                 {
                     RegisterCLRMethodRedirection(i, CLRRedirections.EnumToObject);
@@ -177,6 +187,7 @@ namespace ILRuntime.Runtime.Enviorment
         internal Dictionary<MethodBase, CLRRedirectionDelegate> RedirectMap { get { return redirectMap; } }
         internal Dictionary<FieldInfo, CLRFieldGetterDelegate> FieldGetterMap { get { return fieldGetterMap; } }
         internal Dictionary<FieldInfo, CLRFieldSetterDelegate> FieldSetterMap { get { return fieldSetterMap; } }
+        internal Dictionary<FieldInfo, KeyValuePair<CLRFieldBindingDelegate, CLRFieldBindingDelegate>> FieldBindingMap { get { return fieldBindingMap; } }
         internal Dictionary<Type, CLRMemberwiseCloneDelegate> MemberwiseCloneMap { get { return memberwiseCloneMap; } }
         internal Dictionary<Type, CLRCreateDefaultInstanceDelegate> CreateDefaultInstanceMap { get { return createDefaultInstanceMap; } }
         internal Dictionary<Type, CLRCreateArrayInstanceDelegate> CreateArrayInstanceMap { get { return createArrayInstanceMap; } }
@@ -399,6 +410,7 @@ namespace ILRuntime.Runtime.Enviorment
                     ILType type = new ILType(t, this);
 
                     mapType[t.FullName] = type;
+                    mapTypeToken[type.GetHashCode()] = type;
                     types.Add(type);
 
                 }
@@ -447,6 +459,12 @@ namespace ILRuntime.Runtime.Enviorment
         {
             if (!fieldSetterMap.ContainsKey(f))
                 fieldSetterMap[f] = setter;
+        }
+
+        public void RegisterCLRFieldBinding(FieldInfo f, CLRFieldBindingDelegate copyToStack, CLRFieldBindingDelegate assignFromStack)
+        {
+            if (!fieldBindingMap.ContainsKey(f))
+                fieldBindingMap[f] = new KeyValuePair<CLRFieldBindingDelegate, CLRFieldBindingDelegate>(copyToStack, assignFromStack);
         }
 
         public void RegisterCLRMemberwiseClone(Type t, CLRMemberwiseCloneDelegate memberwiseClone)
@@ -722,6 +740,11 @@ namespace ILRuntime.Runtime.Enviorment
                     {
                         t = ((ILMethod)contextMethod).FindGenericArgument(_ref.Name);
                     }
+                    if (t != null)
+                    {
+                        mapTypeToken[t.GetHashCode()] = t;
+                        mapType[t.FullName] = t;
+                    }
                     return t;
                 }
                 if (_ref.IsByReference)
@@ -740,6 +763,7 @@ namespace ILRuntime.Runtime.Enviorment
                         if (valid)
                         {
                             mapTypeToken[hash] = res;
+                            mapTypeToken[res.GetHashCode()] = res;
                             if (!string.IsNullOrEmpty(res.FullName))
                                 mapType[res.FullName] = res;
                         }
@@ -763,10 +787,8 @@ namespace ILRuntime.Runtime.Enviorment
                             }
                             mapTypeToken[hash] = res;
                         }
-                        else
-                        {
-                            mapTypeToken[res.GetHashCode()] = res;
-                        }
+                        mapTypeToken[res.GetHashCode()] = res;
+
                         if (!string.IsNullOrEmpty(res.FullName))
                             mapType[res.FullName] = res;
                         return res;
@@ -1242,13 +1264,9 @@ namespace ILRuntime.Runtime.Enviorment
                 if (it.TypeReference.HasGenericParameters)
                 {
                     mapTypeToken[type.GetHashCode()] = it;
-                    res = ((long)type.GetHashCode() << 32) | (uint)idx;
-                }
-                else
-                {
-                    res = ((long)it.TypeReference.GetHashCode() << 32) | (uint)idx;
                 }
 
+                res = ((long)type.GetHashCode() << 32) | (uint)idx;
                 return res;
             }
             else
@@ -1262,7 +1280,7 @@ namespace ILRuntime.Runtime.Enviorment
 
         internal long CacheString(object token)
         {
-            long oriHash = token.GetHashCode();
+            long oriHash = token.GetHashCode() & 0xFFFFFFFF;
             long hashCode = oriHash;
             string str = (string)token;
             lock (mapString)
